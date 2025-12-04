@@ -1,0 +1,261 @@
+/* Debug + stronger smoothing build - 5 channel port
+ - TRIAC_PULSE_US = 600 us
+ - SMOOTH_THRESHOLD_US = 800 us
+ - debug prints scheduled delay every 16 half-cycles
+ - keep indicators on chosen pins, ZC on ZERO_CROSS_PIN
+ - Hardware checklist still applies (ZC RC, gate R & pulldown, snubber, MOC3021)
+*/
+
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <SinricPro.h>
+#include <SinricProDevice.h>
+#include <SinricProSwitch.h>
+#include <SinricProFan.h>
+#include "esp_timer.h"
+
+const char* WIFI_SSID = "your-ssid";
+const char* WIFI_PASS = "your-password";
+const char* SINRICPRO_APP_KEY    = "your-id-here";
+const char* SINRICPRO_APP_SECRET = "your-id-here";
+
+/* --- EDIT: replace the placeholder device IDs with your 5 actual SinricPro device IDs --- */
+const String DEVICE_IDS[] = {
+  "REPLACE_WITH_DEVICE_ID_0", // dev0
+  "REPLACE_WITH_DEVICE_ID_1", // dev1
+  "REPLACE_WITH_DEVICE_ID_2", // dev2
+  "REPLACE_WITH_DEVICE_ID_3", // dev3
+  "REPLACE_WITH_DEVICE_ID_4"  // dev4
+};
+
+const int NUM_DEVICES = 5;
+
+/* --- EDIT: choose pins that suit your PCB/ESP32 board.
+   Make sure these pins are safe for output and not used by other peripherals. --- */
+const int ZERO_CROSS_PIN = 12;
+const int TRIAC_PINS[NUM_DEVICES]  = { 27, 25, 26, 14, 33 };      // gate pins for triacs (one per channel)
+const int INDICATOR_PINS[NUM_DEVICES] = { 22, 23, 21, 19, 18 };   // LEDs or indicators
+
+const float MAINS_FREQ = 50.0f;
+const uint32_t HALF_CYCLE_US = (uint32_t)(1e6f / (2.0f * MAINS_FREQ)); // ~10000us
+
+/* SOFTWARE TUNING (adjustable) */
+const uint32_t TRIAC_PULSE_US = 600;      // longer gate pulse to improve latching
+const uint32_t ZC_TIMEOUT_MS   = 200;
+const uint32_t ZC_DEBOUNCE_US  = 4000;    // 4 ms debounce
+const uint32_t SMOOTH_THRESHOLD_US = 800; // ignore changes <800us to reduce visible pulsing
+
+enum DevType { BULB, FAN };
+
+/* --- EDIT: set device type per channel (FAN or BULB) as you need --- */
+const DevType deviceTypes[NUM_DEVICES] = { FAN, BULB, BULB, FAN, BULB };
+
+/* timers, synchronization */
+esp_timer_handle_t softTimers[NUM_DEVICES];
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+volatile bool zcDetected = false;
+volatile uint64_t zcTimestampUs = 0;
+unsigned long lastZcMs = 0;
+volatile uint64_t last_valid_zc_us = 0;
+
+volatile uint32_t firingDelayUs[NUM_DEVICES];
+volatile uint32_t lastFiringDelayUs[NUM_DEVICES];
+volatile bool requestedOn[NUM_DEVICES];
+volatile uint8_t requestedSpeed[NUM_DEVICES];
+bool deviceEnabled[NUM_DEVICES];
+
+inline uint32_t clampDelay(uint32_t d) { if (d >= HALF_CYCLE_US) return HALF_CYCLE_US - 50; return d; }
+uint32_t dimToDelayUs(uint8_t percent) {
+  float level = (float)percent / 100.0f;
+  uint32_t delay = (uint32_t)((1.0f - level) * (float)HALF_CYCLE_US);
+  return clampDelay(delay);
+}
+
+/* Generic soft callback for all timers:
+   arg is the integer device index passed as (void*)(intptr_t)i
+*/
+void IRAM_ATTR soft_cb(void* arg){
+  int idx = (int)(intptr_t)arg;
+  if (idx < 0 || idx >= NUM_DEVICES) return;
+  // pulse triac gate
+  digitalWrite(TRIAC_PINS[idx], HIGH);
+  ets_delay_us(TRIAC_PULSE_US);
+  digitalWrite(TRIAC_PINS[idx], LOW);
+}
+
+/* ISR & pulse */
+void IRAM_ATTR zeroCrossISR() {
+  uint64_t now = esp_timer_get_time();
+  uint64_t prev = last_valid_zc_us;
+  if (prev != 0 && (now - prev) < ZC_DEBOUNCE_US) return; // debounce
+  last_valid_zc_us = now;
+  zcTimestampUs = now;
+  zcDetected = true;
+  lastZcMs = (unsigned long)(now / 1000ULL);
+}
+
+/* Sinric callbacks */
+bool onPowerState_Sinric(const String &deviceId, bool &state) {
+  for (int i=0;i<NUM_DEVICES;++i){
+    if (DEVICE_IDS[i]==deviceId){
+      requestedOn[i]=state;
+      digitalWrite(INDICATOR_PINS[i], state?HIGH:LOW);
+      if (!state){
+        requestedSpeed[i]=0;
+        firingDelayUs[i]=HALF_CYCLE_US-50;
+        (void)esp_timer_stop(softTimers[i]);
+        digitalWrite(TRIAC_PINS[i], LOW);
+        Serial.printf("[Sinric] dev%d OFF - timer stopped, gate LOW\n", i);
+      } else Serial.printf("[Sinric] dev%d ON\n", i);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool onSetPowerLevel_Sinric(const String &deviceId, int &powerLevel) {
+  for (int i=0;i<NUM_DEVICES;++i){
+    if (DEVICE_IDS[i]==deviceId){
+      if (powerLevel<0) powerLevel=0;
+      if (powerLevel>100) powerLevel=100;
+      requestedSpeed[i]=(uint8_t)powerLevel;
+      requestedOn[i]=(powerLevel>0);
+      digitalWrite(INDICATOR_PINS[i], requestedOn[i]?HIGH:LOW);
+      if (!requestedOn[i]){ (void)esp_timer_stop(softTimers[i]); digitalWrite(TRIAC_PINS[i], LOW); }
+      Serial.printf("[Sinric] dev%d LEVEL %d\n", i, powerLevel);
+      return true;
+    }
+  }
+  return false;
+}
+
+/* Setup helpers */
+void setupWiFi(){
+  Serial.print("Connecting ");
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long s=millis();
+  while(WiFi.status()!=WL_CONNECTED){
+    delay(250); Serial.print(".");
+    if (millis()-s>20000){ Serial.println("\nWiFi timeout, retry..."); s=millis(); }
+  }
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+}
+void setupOTA(){
+  ArduinoOTA.setHostname("esp32-triac-5dev");
+  ArduinoOTA.onStart([](){ Serial.println("OTA start"); });
+  ArduinoOTA.onEnd([](){ Serial.println("\nOTA end"); });
+  ArduinoOTA.onError([](ota_error_t err){ Serial.printf("OTA err[%u]\n", err); });
+  ArduinoOTA.begin();
+}
+
+/* Sinric controller binding */
+void setupSinricProControllers(){
+  for (int i=0;i<NUM_DEVICES;++i){
+    if (deviceTypes[i]==FAN){
+      SinricProFan &f = SinricPro[DEVICE_IDS[i]];
+      f.onPowerState(onPowerState_Sinric);
+      f.onPowerLevel(onSetPowerLevel_Sinric);
+      Serial.printf("Registered FAN %d id=%s\n", i, DEVICE_IDS[i].c_str());
+    } else {
+      SinricProSwitch &s = SinricPro[DEVICE_IDS[i]];
+      s.onPowerState(onPowerState_Sinric);
+      Serial.printf("Registered BULB %d id=%s\n", i, DEVICE_IDS[i].c_str());
+    }
+  }
+  SinricPro.begin(SINRICPRO_APP_KEY, SINRICPRO_APP_SECRET);
+  Serial.println("SinricPro started");
+}
+
+void hardwareSetup(){
+  pinMode(ZERO_CROSS_PIN, INPUT_PULLUP);
+  for (int i=0;i<NUM_DEVICES;++i){
+    pinMode(TRIAC_PINS[i], OUTPUT);
+    digitalWrite(TRIAC_PINS[i], LOW);
+    pinMode(INDICATOR_PINS[i], OUTPUT);
+    digitalWrite(INDICATOR_PINS[i], LOW);
+    deviceEnabled[i]=true;
+  }
+  attachInterrupt(digitalPinToInterrupt(ZERO_CROSS_PIN), zeroCrossISR, RISING);
+
+  // create timers
+  for (int i=0;i<NUM_DEVICES;++i){
+    esp_timer_create_args_t args;
+    memset(&args, 0, sizeof(args));
+    args.callback = &soft_cb;
+    args.arg = (void*)(intptr_t)i;
+    // create a simple name per timer
+    static char namebuf[NUM_DEVICES][16];
+    snprintf(namebuf[i], sizeof(namebuf[i]), "t%d", i);
+    args.name = namebuf[i];
+    ESP_ERROR_CHECK( esp_timer_create(&args, &softTimers[i]) );
+  }
+}
+
+volatile uint32_t zc_counter = 0;
+
+void setup(){
+  Serial.begin(115200); delay(200);
+  hardwareSetup(); setupWiFi(); setupOTA(); setupSinricProControllers();
+  for (int i=0;i<NUM_DEVICES;++i){
+    requestedOn[i]=false; requestedSpeed[i]=0;
+    firingDelayUs[i]=HALF_CYCLE_US-50; lastFiringDelayUs[i]=firingDelayUs[i];
+  }
+  lastZcMs = millis(); last_valid_zc_us = 0;
+  Serial.println("Ready - debug anti-pulse 5-channel build");
+}
+
+void loop(){
+  ArduinoOTA.handle(); SinricPro.handle();
+
+  if (millis() - lastZcMs > ZC_TIMEOUT_MS){
+    for (int i=0;i<NUM_DEVICES;++i) deviceEnabled[i]=false;
+    static bool w=false; if (!w){ Serial.println("[SAFETY] ZC missing"); w=true; }
+  } else for (int i=0;i<NUM_DEVICES;++i) deviceEnabled[i]=true;
+
+  if (zcDetected){
+    portENTER_CRITICAL(&mux); zcDetected=false; portEXIT_CRITICAL(&mux);
+    zc_counter++;
+
+    for (int i=0;i<NUM_DEVICES;++i){
+      if (!requestedOn[i] || !deviceEnabled[i]){
+        (void)esp_timer_stop(softTimers[i]);
+        digitalWrite(TRIAC_PINS[i], LOW);
+        firingDelayUs[i]=HALF_CYCLE_US-50;
+        continue;
+      }
+
+      uint32_t delayUs = HALF_CYCLE_US - 50;
+      if (deviceTypes[i]==BULB) delayUs = dimToDelayUs( (requestedSpeed[i]>0)?requestedSpeed[i]:100 );
+      else delayUs = dimToDelayUs(requestedSpeed[i]);
+
+      uint32_t prev = lastFiringDelayUs[i];
+      uint32_t diff = (delayUs > prev) ? delayUs - prev : prev - delayUs;
+      if (diff < SMOOTH_THRESHOLD_US) {
+        delayUs = prev;
+      } else {
+        lastFiringDelayUs[i] = delayUs;
+      }
+
+      firingDelayUs[i]=delayUs;
+      (void)esp_timer_stop(softTimers[i]);
+      esp_err_t rc = esp_timer_start_once(softTimers[i], delayUs);
+      if (rc != ESP_OK) Serial.printf("[WARN] timer start rc=%d dev=%d\n", rc, i);
+    }
+
+    // debug print every 16 half-cycles (~8 cycles)
+    if ((zc_counter & 0xF) == 0) {
+      Serial.print("dbg: ");
+      for (int i=0;i<NUM_DEVICES;++i){
+        Serial.printf("dev%d delay=%u last=%u reqOn=%d speed=%u | ", i, (unsigned)firingDelayUs[i], (unsigned)lastFiringDelayUs[i], requestedOn[i], requestedSpeed[i]);
+      }
+      Serial.println();
+    }
+
+    lastZcMs = millis();
+  }
+
+  delay(2);
+}
